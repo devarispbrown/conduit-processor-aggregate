@@ -442,8 +442,7 @@ func TestProcessor_MultipleAggregations_AllTypes(t *testing.T) {
 	aggregations := p.calculateAggregations(group)
 
 	// Verify count
-	assert.Equal(t, 3, aggregations["count"])
-
+	assert.Equal(t, float64(3), aggregations["count"])
 	// Verify sum
 	sums := aggregations["sum"].(map[string]float64)
 	assert.Equal(t, 450.0, sums["price"])  // 100 + 200 + 150
@@ -465,10 +464,10 @@ func TestProcessor_MultipleAggregations_AllTypes(t *testing.T) {
 	assert.Equal(t, 3.0, maxs["quantity"])
 
 	// Verify unique_count
-	uniqueCounts := aggregations["unique_count"].(map[string]int)
-	assert.Equal(t, 3, uniqueCounts["price"])    // All unique
-	assert.Equal(t, 3, uniqueCounts["quantity"]) // All unique
-	assert.Equal(t, 2, uniqueCounts["user_id"])  // user1 appears twice
+	uniqueCounts := aggregations["unique_count"].(map[string]float64)
+	assert.Equal(t, float64(3), uniqueCounts["price"])    // All unique
+	assert.Equal(t, float64(3), uniqueCounts["quantity"]) // All unique
+	assert.Equal(t, float64(2), uniqueCounts["user_id"])  // user1 appears twice
 
 	// Verify collect
 	collections := aggregations["collect"].(map[string][]interface{})
@@ -738,12 +737,12 @@ func TestProcessor_WindowCompletion(t *testing.T) {
 
 			// Check required fields
 			assert.Equal(t, "user1", payload["group_key"])
-			assert.Equal(t, 1, payload["count"])
+			assert.Equal(t, float64(1), payload["count"])
 
 			// Check group_value
 			groupValue, ok := payload["group_value"].(map[string]interface{})
 			require.True(t, ok)
-			assert.Equal(t, 1, groupValue["count"])
+			assert.Equal(t, float64(1), groupValue["count"])
 		}
 	}
 

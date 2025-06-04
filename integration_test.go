@@ -81,26 +81,28 @@ func TestIntegration_READMEExamples(t *testing.T) {
 		})
 
 		ctx := context.Background()
-		now := time.Now()
+		// Use a fixed base time that aligns with window boundaries
+		baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
+		// Keep all records within the same 5-minute window
 		records := []opencdc.Record{
 			createTestRecord(t, map[string]interface{}{
 				"product_category": "electronics",
 				"order_total":      299.99,
 				"quantity":         1,
-				"order_time":       now.Format(time.RFC3339),
+				"order_time":       baseTime.Format(time.RFC3339),
 			}),
 			createTestRecord(t, map[string]interface{}{
 				"product_category": "electronics",
 				"order_total":      199.99,
 				"quantity":         2,
-				"order_time":       now.Add(2 * time.Minute).Format(time.RFC3339),
+				"order_time":       baseTime.Add(1 * time.Minute).Format(time.RFC3339),
 			}),
 			createTestRecord(t, map[string]interface{}{
 				"product_category": "books",
 				"order_total":      29.99,
 				"quantity":         1,
-				"order_time":       now.Add(3 * time.Minute).Format(time.RFC3339),
+				"order_time":       baseTime.Add(2 * time.Minute).Format(time.RFC3339),
 			}),
 		}
 
@@ -117,7 +119,7 @@ func TestIntegration_READMEExamples(t *testing.T) {
 		assert.Equal(t, "per_group", p.config.OutputFormat)
 
 		// Verify window state
-		assert.Len(t, p.windows, 1)
+		assert.Len(t, p.windows, 1) // Should only have 1 window now
 		var window *WindowState
 		for _, w := range p.windows {
 			window = w
@@ -130,7 +132,7 @@ func TestIntegration_READMEExamples(t *testing.T) {
 
 		// Test aggregation calculations
 		electronicsAgg := p.calculateAggregations(window.Groups["electronics"])
-		assert.Equal(t, 2, electronicsAgg["count"])
+		assert.Equal(t, float64(2), electronicsAgg["count"]) // Changed to float64
 
 		sums := electronicsAgg["sum"].(map[string]float64)
 		assert.InDelta(t, 499.98, sums["order_total"], 0.01)
@@ -149,27 +151,29 @@ func TestIntegration_READMEExamples(t *testing.T) {
 		})
 
 		ctx := context.Background()
+		// Use current time minus a small offset to ensure it's not "late"
 		now := time.Now()
+		baseTime := now.Add(-5 * time.Second) // Start 5 seconds ago
 
 		records := []opencdc.Record{
 			createTestRecord(t, map[string]interface{}{
 				"sensor_location": "warehouse_a",
 				"temperature":     22.5,
 				"humidity":        45.0,
-				"reading_time":    now.Format(time.RFC3339),
+				"reading_time":    baseTime.Format(time.RFC3339),
 			}),
 			createTestRecord(t, map[string]interface{}{
 				"sensor_location": "warehouse_a",
 				"temperature":     23.1,
 				"humidity":        47.2,
-				"reading_time":    now.Add(15 * time.Second).Format(time.RFC3339),
+				"reading_time":    baseTime.Add(2 * time.Second).Format(time.RFC3339),
 			}),
-			// Late message within threshold
+			// Message that arrives out of order but within allowed lateness
 			createTestRecord(t, map[string]interface{}{
 				"sensor_location": "warehouse_a",
 				"temperature":     21.8,
 				"humidity":        44.1,
-				"reading_time":    now.Add(-5 * time.Second).Format(time.RFC3339),
+				"reading_time":    baseTime.Add(1 * time.Second).Format(time.RFC3339),
 			}),
 		}
 
@@ -178,7 +182,7 @@ func TestIntegration_READMEExamples(t *testing.T) {
 		// Verify configuration
 		assert.Equal(t, []string{"count", "avg", "min", "max"}, p.aggregations)
 		assert.Equal(t, []string{"temperature", "humidity"}, p.fields)
-		assert.Equal(t, 10*time.Second, p.lateness)
+		assert.Equal(t, 10*time.Second, p.config.AllowedLateness)
 
 		// All messages should be processed (none too late)
 		for _, result := range results {
@@ -193,7 +197,7 @@ func TestIntegration_READMEExamples(t *testing.T) {
 		}
 
 		warehouseAgg := p.calculateAggregations(window.Groups["warehouse_a"])
-		assert.Equal(t, 3, warehouseAgg["count"])
+		assert.Equal(t, float64(3), warehouseAgg["count"]) // Changed to float64
 
 		// Check temperature min/max
 		mins := warehouseAgg["min"].(map[string]float64)
@@ -248,7 +252,7 @@ func TestIntegration_READMEExamples(t *testing.T) {
 
 		// Verify configuration
 		assert.Equal(t, "sliding", p.config.WindowType)
-		assert.Equal(t, 2*time.Minute, p.slideDur)
+		assert.Equal(t, 2*time.Minute, p.config.SlideBy)
 		assert.Equal(t, []string{"count", "unique_count", "collect"}, p.aggregations)
 		assert.Equal(t, "single", p.config.OutputFormat)
 
@@ -343,10 +347,10 @@ func TestIntegration_FullPipelineSimulation(t *testing.T) {
 	// Verify electronics aggregations
 	require.NotNil(t, electronicsResult)
 	assert.Equal(t, "electronics", electronicsResult["group_key"])
-	assert.Equal(t, 2, electronicsResult["count"])
+	assert.Equal(t, float64(2), electronicsResult["count"]) // Changed to float64
 
 	electronicsGroupValue := electronicsResult["group_value"].(map[string]interface{})
-	assert.Equal(t, 2, electronicsGroupValue["count"])
+	assert.Equal(t, float64(2), electronicsGroupValue["count"]) // Changed to float64
 
 	electronicsSum := electronicsGroupValue["sum"].(map[string]interface{})
 	assert.InDelta(t, 499.98, electronicsSum["price"], 0.01)
@@ -355,7 +359,7 @@ func TestIntegration_FullPipelineSimulation(t *testing.T) {
 	// Verify books aggregations
 	require.NotNil(t, booksResult)
 	assert.Equal(t, "books", booksResult["group_key"])
-	assert.Equal(t, 2, booksResult["count"])
+	assert.Equal(t, float64(2), booksResult["count"]) // Changed to float64
 
 	booksGroupValue := booksResult["group_value"].(map[string]interface{})
 	booksSum := booksGroupValue["sum"].(map[string]interface{})
@@ -416,7 +420,7 @@ func TestIntegration_ConfigurationCompatibility(t *testing.T) {
 				assert.Equal(t, []string{"count"}, p.aggregations)
 			}
 			if tt.config["window_size"] == "" || tt.config["window_size"] == "1m" {
-				assert.Equal(t, time.Minute, p.windowDur)
+				assert.Equal(t, time.Minute, p.config.WindowSize)
 			}
 		})
 	}

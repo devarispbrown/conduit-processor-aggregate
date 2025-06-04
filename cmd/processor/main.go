@@ -8,5 +8,6 @@ import (
 )
 
 func main() {
+	// Ensure the processor embeds UnimplementedProcessor
 	sdk.Run(aggregate.NewProcessor())
 }
