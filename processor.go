@@ -11,388 +11,312 @@ import (
 	"github.com/conduitio/conduit-commons/config"
 	"github.com/conduitio/conduit-commons/opencdc"
 	sdk "github.com/conduitio/conduit-processor-sdk"
+	"github.com/rs/zerolog"
 )
 
-//go:generate paramgen -output=paramgen_proc.go ProcessorConfig
-
-// ProcessorConfig holds the processor configuration.
-type ProcessorConfig struct {
-	// GroupBy is the field path to group messages by (e.g., "user_id" or "user.profile.id")
-	GroupBy string `json:"group_by" validate:"required"`
-
-	// WindowSize defines the time window duration (e.g., "1m", "5s", "1h")
-	WindowSize string `json:"window_size" default:"1m"`
-
-	// WindowType defines the window type: "tumbling" or "sliding"
-	WindowType string `json:"window_type" default:"tumbling" validate:"inclusion[tumbling,sliding]"`
-
-	// SlideBy defines the slide interval for sliding windows (e.g., "30s")
-	// Only used when WindowType is "sliding"
-	SlideBy string `json:"slide_by" default:"30s"`
-
-	// AllowedLateness allows late messages within this duration
-	AllowedLateness string `json:"allowed_lateness" default:"0s"`
-
-	// TimestampField is the field to use for event time (empty = processing time)
-	TimestampField string `json:"timestamp_field"`
-
-	// Aggregations defines what aggregations to perform on the grouped data
-	// Supported: sum, count, avg, min, max, unique_count, collect
-	Aggregations []string `json:"aggregations" default:"count"`
-
-	// Fields defines which fields to aggregate (used with sum, avg, min, max)
-	Fields []string `json:"fields"`
-
-	// OutputFormat defines how to output results: "single" or "per_group"
-	OutputFormat string `json:"output_format" default:"single" validate:"inclusion[single,per_group]"`
-}
-
-// WindowState holds the state for a single window
-type WindowState struct {
-	WindowStart  time.Time                           `json:"window_start"`
-	WindowEnd    time.Time                           `json:"window_end"`
-	Groups       map[string][]map[string]interface{} `json:"groups"`
-	MessageCount int                                 `json:"message_count"`
-	LastActivity time.Time                           `json:"last_activity"`
-}
-
-// Processor implements the aggregate processor
 type Processor struct {
 	sdk.UnimplementedProcessor
-	config    ProcessorConfig
-	windowDur time.Duration
-	slideDur  time.Duration
-	lateness  time.Duration
-	windows   map[string]*WindowState
+	config       ProcessorConfig
+	aggregations []string
+	fields       []string
+	windows      map[string]*WindowState
+	logger       *zerolog.Logger
 }
 
-// Specification returns the processor specification
+type ProcessorConfig struct {
+	GroupBy         string        `json:"group_by"`
+	WindowSize      time.Duration `json:"window_size"`
+	WindowType      string        `json:"window_type"`
+	SlideBy         time.Duration `json:"slide_by"`
+	TimestampField  string        `json:"timestamp_field"`
+	AllowedLateness time.Duration `json:"allowed_lateness"`
+	Aggregations    string        `json:"aggregations"`
+	Fields          string        `json:"fields"`
+	OutputFormat    string        `json:"output_format"`
+}
+
+type WindowState struct {
+	WindowStart  time.Time
+	WindowEnd    time.Time
+	Groups       map[string][]map[string]interface{}
+	MessageCount int
+}
+
+// NewProcessor creates a new instance of the aggregate processor
+func NewProcessor() *Processor {
+	return &Processor{}
+}
+
 func (p *Processor) Specification() (sdk.Specification, error) {
 	return sdk.Specification{
-		Name:    "aggregate",
-		Summary: "Window-based aggregation processor with grouping capabilities",
-		Description: `Aggregates messages within time windows, similar to Redpanda Connect's windowing.
-Supports tumbling and sliding windows with configurable grouping and aggregation functions.
-Provides count, sum, avg, min, max, unique_count, and collect aggregations.`,
-		Version:    "v1.0.0",
-		Author:     "Conduit",
-		Parameters: ProcessorConfig{}.Parameters(),
+		Name:        "aggregate",
+		Version:     "v1.0.0",
+		Author:      "Devaris Brown",
+		Summary:     "Windowed aggregation processor for streaming data",
+		Description: "Groups streaming messages by time windows and field values, then applies aggregation functions like count, sum, average, min, max, and more.",
+		Parameters: config.Parameters{
+			"group_by": {
+				Default:     "",
+				Type:        config.ParameterTypeString,
+				Description: "Field to group messages by (supports nested fields like user.profile.id)",
+				Validations: []config.Validation{
+					config.ValidationRequired{},
+				},
+			},
+			"window_size": {
+				Default:     "1m",
+				Type:        config.ParameterTypeDuration,
+				Description: "Window duration (e.g., 1m, 30s, 1h)",
+			},
+			"window_type": {
+				Default:     "tumbling",
+				Type:        config.ParameterTypeString,
+				Description: "Window type: tumbling or sliding",
+				Validations: []config.Validation{
+					config.ValidationInclusion{List: []string{"tumbling", "sliding"}},
+				},
+			},
+			"slide_by": {
+				Default:     "30s",
+				Type:        config.ParameterTypeDuration,
+				Description: "Slide interval for sliding windows",
+			},
+			"timestamp_field": {
+				Default:     "",
+				Type:        config.ParameterTypeString,
+				Description: "Field containing event timestamp (uses processing time if empty)",
+			},
+			"allowed_lateness": {
+				Default:     "0s",
+				Type:        config.ParameterTypeDuration,
+				Description: "Maximum lateness for messages",
+			},
+			"aggregations": {
+				Default:     "count",
+				Type:        config.ParameterTypeString,
+				Description: "Comma-separated list of aggregation functions: count,sum,avg,min,max,unique_count,collect",
+			},
+			"fields": {
+				Default:     "",
+				Type:        config.ParameterTypeString,
+				Description: "Comma-separated list of fields to aggregate (required for numeric functions)",
+			},
+			"output_format": {
+				Default:     "single",
+				Type:        config.ParameterTypeString,
+				Description: "Output format: single (all groups in one record) or per_group (separate record per group)",
+				Validations: []config.Validation{
+					config.ValidationInclusion{List: []string{"single", "per_group"}},
+				},
+			},
+		},
 	}, nil
 }
 
-// Configure configures the processor
 func (p *Processor) Configure(ctx context.Context, cfg config.Config) error {
-	var config ProcessorConfig
-	err := sdk.ParseConfig(ctx, cfg, &config, ProcessorConfig{}.Parameters())
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
+	logger := sdk.Logger(ctx)
+	p.logger = logger
+	p.logger.Debug().Msg("sanitizing configuration and applying defaults")
+
+	// Apply defaults manually since we're not using SDK parsing
+	if cfg["window_size"] == "" {
+		cfg["window_size"] = "1m"
+	}
+	if cfg["window_type"] == "" {
+		cfg["window_type"] = "tumbling"
+	}
+	if cfg["slide_by"] == "" {
+		cfg["slide_by"] = "30s"
+	}
+	if cfg["allowed_lateness"] == "" {
+		cfg["allowed_lateness"] = "0s"
+	}
+	if cfg["aggregations"] == "" {
+		cfg["aggregations"] = "count"
+	}
+	if cfg["output_format"] == "" {
+		cfg["output_format"] = "single"
 	}
 
-	// Parse durations
-	p.windowDur, err = time.ParseDuration(config.WindowSize)
+	p.logger.Debug().Msg("validating configuration according to the specifications")
+
+	// Validate required fields
+	if cfg["group_by"] == "" {
+		return fmt.Errorf("group_by: required parameter is not provided")
+	}
+
+	// Parse window_size
+	windowSize, err := time.ParseDuration(cfg["window_size"])
 	if err != nil {
 		return fmt.Errorf("invalid window_size: %w", err)
 	}
 
-	p.slideDur, err = time.ParseDuration(config.SlideBy)
+	// Parse slide_by
+	slideBy, err := time.ParseDuration(cfg["slide_by"])
 	if err != nil {
 		return fmt.Errorf("invalid slide_by: %w", err)
 	}
 
-	p.lateness, err = time.ParseDuration(config.AllowedLateness)
+	// Parse allowed_lateness
+	allowedLateness, err := time.ParseDuration(cfg["allowed_lateness"])
 	if err != nil {
 		return fmt.Errorf("invalid allowed_lateness: %w", err)
 	}
 
+	// Validate window_type
+	windowType := cfg["window_type"]
+	if windowType != "tumbling" && windowType != "sliding" {
+		return fmt.Errorf("invalid window_type: must be 'tumbling' or 'sliding'")
+	}
+
 	// Validate sliding window configuration
-	if config.WindowType == "sliding" && p.slideDur >= p.windowDur {
+	if windowType == "sliding" && slideBy >= windowSize {
 		return fmt.Errorf("slide_by must be less than window_size for sliding windows")
 	}
 
-	// Validate aggregations
-	validAggs := map[string]bool{
-		"sum": true, "count": true, "avg": true, "min": true,
-		"max": true, "unique_count": true, "collect": true,
+	// Validate output_format
+	outputFormat := cfg["output_format"]
+	if outputFormat != "single" && outputFormat != "per_group" {
+		return fmt.Errorf("invalid output_format: must be 'single' or 'per_group'")
 	}
-	for _, agg := range config.Aggregations {
-		if !validAggs[agg] {
+
+	// Set configuration
+	p.config = ProcessorConfig{
+		GroupBy:         cfg["group_by"],
+		WindowSize:      windowSize,
+		WindowType:      windowType,
+		SlideBy:         slideBy,
+		TimestampField:  cfg["timestamp_field"],
+		AllowedLateness: allowedLateness,
+		Aggregations:    cfg["aggregations"],
+		Fields:          cfg["fields"],
+		OutputFormat:    outputFormat,
+	}
+
+	// Parse comma-separated aggregations
+	p.aggregations = parseCommaSeparated(p.config.Aggregations)
+	if len(p.aggregations) == 0 {
+		p.aggregations = []string{"count"}
+	}
+
+	// Parse comma-separated fields
+	p.fields = parseCommaSeparated(p.config.Fields)
+
+	// Validate aggregations
+	validAggregations := map[string]bool{
+		"count": true, "sum": true, "avg": true, "min": true, "max": true,
+		"unique_count": true, "collect": true,
+	}
+
+	numericAggregations := map[string]bool{
+		"sum": true, "avg": true, "min": true, "max": true, "unique_count": true, "collect": true,
+	}
+
+	var needsFields []string
+	for _, agg := range p.aggregations {
+		if !validAggregations[agg] {
 			return fmt.Errorf("unsupported aggregation: %s", agg)
 		}
-	}
-
-	// Validate that fields are specified for numeric aggregations
-	numericAggs := []string{"sum", "avg", "min", "max"}
-	for _, agg := range config.Aggregations {
-		for _, numAgg := range numericAggs {
-			if agg == numAgg && len(config.Fields) == 0 {
-				return fmt.Errorf("fields must be specified for %s aggregation", agg)
-			}
+		if numericAggregations[agg] {
+			needsFields = append(needsFields, agg)
 		}
 	}
 
-	p.config = config
+	// Check if fields are required but missing
+	if len(needsFields) > 0 && len(p.fields) == 0 {
+		return fmt.Errorf("fields must be specified for aggregations: %v", needsFields)
+	}
+
+	p.logger.Debug().Interface("target", &p.config).Msg("decoding configuration into the target object")
+
+	p.logger.Info().
+		Strs("aggregations", p.aggregations).
+		Strs("fields", p.fields).
+		Str("group_by", p.config.GroupBy).
+		Str("output_format", p.config.OutputFormat).
+		Dur("window_size", p.config.WindowSize).
+		Str("window_type", p.config.WindowType).
+		Msg("Processor configured successfully")
+
+	return nil
+}
+
+func (p *Processor) Open(ctx context.Context) error {
 	p.windows = make(map[string]*WindowState)
 	return nil
 }
 
-// Open initializes the processor
-func (p *Processor) Open(ctx context.Context) error {
-	// Start background cleanup routine
-	go p.cleanupRoutine(ctx)
-	return nil
-}
-
-// Process processes a batch of records
 func (p *Processor) Process(ctx context.Context, records []opencdc.Record) []sdk.ProcessedRecord {
-	results := make([]sdk.ProcessedRecord, 0)
-	logger := sdk.Logger(ctx)
+	results := make([]sdk.ProcessedRecord, 0, len(records))
+	now := time.Now()
 
 	for _, record := range records {
 		// Extract timestamp
-		eventTime := p.extractTimestamp(record)
+		timestamp, err := p.extractTimestamp(record)
+		if err != nil {
+			p.logger.Debug().Err(err).Msg("failed to extract timestamp, using current time")
+			timestamp = now
+		}
 
-		// Skip late messages if configured
-		if p.lateness > 0 && time.Since(eventTime) > p.lateness {
-			logger.Trace().
-				Time("event_time", eventTime).
-				Dur("lateness", time.Since(eventTime)).
+		// Check if message is late
+		if p.isLateMessage(timestamp) {
+			lateness := now.Sub(timestamp).Seconds()
+			p.logger.Trace().
+				Time("event_time", timestamp).
+				Float64("lateness", lateness).
 				Msg("Dropping late message")
+
+			// Return FilterRecord for late messages
 			results = append(results, sdk.FilterRecord{})
 			continue
 		}
 
-		// Extract payload
+		// Extract group key
+		groupKey, err := p.extractGroupKey(record)
+		if err != nil {
+			p.logger.Debug().Err(err).Msg("failed to extract group key")
+			// Return ErrorRecord for invalid records
+			results = append(results, sdk.ErrorRecord{Error: err})
+			continue
+		}
+
+		// Extract payload for aggregation
 		payload, err := p.extractPayload(record)
 		if err != nil {
+			p.logger.Debug().Err(err).Msg("failed to extract payload")
+			// Return ErrorRecord for invalid JSON
 			results = append(results, sdk.ErrorRecord{Error: err})
 			continue
 		}
 
-		// Extract group key
-		groupKey, err := p.extractGroupKey(payload)
-		if err != nil {
-			results = append(results, sdk.ErrorRecord{Error: err})
-			continue
-		}
+		// Add to appropriate windows
+		p.addToWindows(record, payload, groupKey, timestamp)
 
-		// Get or create window(s) for this message
-		windowKeys := p.getWindowKeys(eventTime)
-		for _, windowKey := range windowKeys {
-			window := p.getOrCreateWindow(windowKey, eventTime)
-
-			// Add message to window
-			if window.Groups[groupKey] == nil {
-				window.Groups[groupKey] = make([]map[string]interface{}, 0)
-			}
-			window.Groups[groupKey] = append(window.Groups[groupKey], payload)
-			window.MessageCount++
-			window.LastActivity = time.Now()
-		}
-
-		// Always filter individual messages - aggregated results are emitted by cleanup routine
+		// Always return FilterRecord for individual records
+		// Aggregated output happens only when windows complete
 		results = append(results, sdk.FilterRecord{})
 	}
-
-	// Check for completed windows and emit results
-	completedResults := p.emitCompletedWindows(ctx)
-	results = append(results, completedResults...)
 
 	return results
 }
 
-// Teardown cleans up resources
 func (p *Processor) Teardown(ctx context.Context) error {
-	// Emit any remaining windows
-	p.emitCompletedWindows(ctx)
 	return nil
 }
 
-// MiddlewareOptions returns middleware options
 func (p *Processor) MiddlewareOptions() []sdk.ProcessorMiddlewareOption {
 	return nil
 }
 
-// extractTimestamp extracts the timestamp from a record
-func (p *Processor) extractTimestamp(record opencdc.Record) time.Time {
-	if p.config.TimestampField == "" {
-		return time.Now() // Use processing time
-	}
-
-	payload, err := p.extractPayload(record)
-	if err != nil {
-		return time.Now()
-	}
-
-	timestampValue := getNestedValue(payload, p.config.TimestampField)
-	if timestampValue == nil {
-		return time.Now()
-	}
-
-	// Try to parse various timestamp formats
-	switch v := timestampValue.(type) {
-	case string:
-		// Try RFC3339 first
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			return t
-		}
-		// Try ISO 8601
-		if t, err := time.Parse("2006-01-02T15:04:05", v); err == nil {
-			return t
-		}
-		// Try other formats...
-		formats := []string{
-			"2006-01-02 15:04:05",
-			"2006-01-02",
-		}
-		for _, format := range formats {
-			if t, err := time.Parse(format, v); err == nil {
-				return t
-			}
-		}
-	case int64:
-		return time.Unix(v, 0)
-	case float64:
-		return time.Unix(int64(v), 0)
-	}
-
-	return time.Now()
-}
-
-// extractPayload extracts the payload from a record
-func (p *Processor) extractPayload(record opencdc.Record) (map[string]interface{}, error) {
-	var payload map[string]interface{}
-	if err := json.Unmarshal(record.Payload.After.Bytes(), &payload); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal payload: %w", err)
-	}
-	return payload, nil
-}
-
-// extractGroupKey extracts the group key from payload
-func (p *Processor) extractGroupKey(payload map[string]interface{}) (string, error) {
-	value := getNestedValue(payload, p.config.GroupBy)
-	if value == nil {
-		return "", fmt.Errorf("group_by field '%s' not found", p.config.GroupBy)
-	}
-	return fmt.Sprintf("%v", value), nil
-}
-
-// getNestedValue retrieves a value from nested data using a path
-func getNestedValue(data map[string]interface{}, path string) interface{} {
-	if !strings.Contains(path, ".") {
-		return data[path]
-	}
-
-	parts := strings.Split(path, ".")
-	current := data
-
-	for i, part := range parts {
-		if current == nil {
-			return nil
-		}
-
-		if i == len(parts)-1 {
-			return current[part]
-		}
-
-		next, ok := current[part]
-		if !ok {
-			return nil
-		}
-
-		switch v := next.(type) {
-		case map[string]interface{}:
-			current = v
-		default:
-			return nil
-		}
-	}
-
-	return nil
-}
-
-// getWindowKeys returns the window keys for a given timestamp
-func (p *Processor) getWindowKeys(eventTime time.Time) []string {
-	var keys []string
-
-	switch p.config.WindowType {
-	case "tumbling":
-		// Tumbling window - each event belongs to exactly one window
-		windowStart := eventTime.Truncate(p.windowDur)
-		keys = append(keys, p.formatWindowKey(windowStart))
-
-	case "sliding":
-		// Sliding window - event may belong to multiple windows
-		// Calculate how many windows this event should belong to
-		windowCount := int(p.windowDur / p.slideDur)
-
-		for i := 0; i < windowCount; i++ {
-			windowStart := eventTime.Truncate(p.slideDur).Add(-time.Duration(i) * p.slideDur)
-			windowEnd := windowStart.Add(p.windowDur)
-
-			// Check if event falls within this window
-			if !eventTime.Before(windowStart) && eventTime.Before(windowEnd) {
-				keys = append(keys, p.formatWindowKey(windowStart))
-			}
-		}
-	}
-
-	return keys
-}
-
-// formatWindowKey creates a string key for a window
-func (p *Processor) formatWindowKey(windowStart time.Time) string {
-	return fmt.Sprintf("%s_%d", p.config.WindowType, windowStart.Unix())
-}
-
-// getOrCreateWindow gets or creates a window
-func (p *Processor) getOrCreateWindow(windowKey string, eventTime time.Time) *WindowState {
-	if window, exists := p.windows[windowKey]; exists {
-		return window
-	}
-
-	// Parse window start from key
-	parts := strings.Split(windowKey, "_")
-	if len(parts) != 2 {
-		// Fallback
-		windowStart := eventTime.Truncate(p.windowDur)
-		return p.createWindow(windowKey, windowStart)
-	}
-
-	unixTime, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		// Fallback
-		windowStart := eventTime.Truncate(p.windowDur)
-		return p.createWindow(windowKey, windowStart)
-	}
-
-	windowStart := time.Unix(unixTime, 0)
-	return p.createWindow(windowKey, windowStart)
-}
-
-// createWindow creates a new window
-func (p *Processor) createWindow(windowKey string, windowStart time.Time) *WindowState {
-	window := &WindowState{
-		WindowStart:  windowStart,
-		WindowEnd:    windowStart.Add(p.windowDur),
-		Groups:       make(map[string][]map[string]interface{}),
-		MessageCount: 0,
-		LastActivity: time.Now(),
-	}
-	p.windows[windowKey] = window
-	return window
-}
-
-// emitCompletedWindows checks for completed windows and emits results
+// Helper method to emit completed windows (called by tests)
 func (p *Processor) emitCompletedWindows(ctx context.Context) []sdk.ProcessedRecord {
-	results := make([]sdk.ProcessedRecord, 0)
+	var results []sdk.ProcessedRecord
 	now := time.Now()
 
 	for windowKey, window := range p.windows {
-		// Check if window is complete (end time + allowed lateness has passed)
-		if now.After(window.WindowEnd.Add(p.lateness)) {
-			// Create aggregated records for this window
+		if now.After(window.WindowEnd) {
+			// Window completed, generate output
 			aggregatedRecords := p.aggregateWindow(window)
-
 			for _, record := range aggregatedRecords {
 				results = append(results, sdk.SingleRecord(record))
 			}
@@ -405,235 +329,431 @@ func (p *Processor) emitCompletedWindows(ctx context.Context) []sdk.ProcessedRec
 	return results
 }
 
-// aggregateWindow performs aggregations on a completed window
-func (p *Processor) aggregateWindow(window *WindowState) []opencdc.Record {
-	records := make([]opencdc.Record, 0)
+func (p *Processor) extractTimestamp(record opencdc.Record) (time.Time, error) {
+	if p.config.TimestampField == "" {
+		return time.Now(), nil
+	}
 
-	if p.config.OutputFormat == "single" {
-		// Single record with all groups
-		record := p.createSingleAggregateRecord(window)
-		records = append(records, record)
-	} else {
-		// One record per group
-		for groupKey, messages := range window.Groups {
-			record := p.createGroupAggregateRecord(window, groupKey, messages)
-			records = append(records, record)
+	payload, err := p.extractPayload(record)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	timestampValue, err := p.getNestedField(payload, p.config.TimestampField)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	timestampStr, ok := timestampValue.(string)
+	if !ok {
+		return time.Time{}, fmt.Errorf("timestamp field is not a string")
+	}
+
+	return time.Parse(time.RFC3339, timestampStr)
+}
+
+func (p *Processor) isLateMessage(eventTime time.Time) bool {
+	if p.config.AllowedLateness == 0 {
+		return false
+	}
+
+	now := time.Now()
+	lateness := now.Sub(eventTime)
+	return lateness > p.config.AllowedLateness
+}
+
+func (p *Processor) extractGroupKey(record opencdc.Record) (string, error) {
+	payload, err := p.extractPayload(record)
+	if err != nil {
+		return "", err
+	}
+
+	groupValue, err := p.getNestedField(payload, p.config.GroupBy)
+	if err != nil {
+		return "", fmt.Errorf("group_by field '%s' not found", p.config.GroupBy)
+	}
+
+	return fmt.Sprintf("%v", groupValue), nil
+}
+
+func (p *Processor) extractPayload(record opencdc.Record) (map[string]interface{}, error) {
+	var payload map[string]interface{}
+
+	if record.Payload.After != nil {
+		err := json.Unmarshal(record.Payload.After.Bytes(), &payload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal payload: %w", err)
 		}
+	} else {
+		return nil, fmt.Errorf("no payload found")
+	}
+
+	return payload, nil
+}
+
+func (p *Processor) getNestedField(data map[string]interface{}, fieldPath string) (interface{}, error) {
+	fields := strings.Split(fieldPath, ".")
+	current := data
+
+	for i, field := range fields {
+		if i == len(fields)-1 {
+			// Last field, return the value
+			value, exists := current[field]
+			if !exists {
+				return nil, fmt.Errorf("field '%s' not found", field)
+			}
+			return value, nil
+		} else {
+			// Intermediate field, must be a map
+			value, exists := current[field]
+			if !exists {
+				return nil, fmt.Errorf("field '%s' not found", field)
+			}
+
+			if nestedMap, ok := value.(map[string]interface{}); ok {
+				current = nestedMap
+			} else {
+				return nil, fmt.Errorf("field '%s' is not an object", field)
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("field path '%s' is empty", fieldPath)
+}
+
+func (p *Processor) addToWindows(record opencdc.Record, payload map[string]interface{}, groupKey string, timestamp time.Time) {
+	if p.config.WindowType == "tumbling" {
+		p.addToTumblingWindow(payload, groupKey, timestamp)
+	} else {
+		p.addToSlidingWindows(payload, groupKey, timestamp)
+	}
+}
+
+func (p *Processor) addToTumblingWindow(payload map[string]interface{}, groupKey string, timestamp time.Time) {
+	// Calculate window start time
+	windowStart := timestamp.Truncate(p.config.WindowSize)
+	windowEnd := windowStart.Add(p.config.WindowSize)
+
+	windowKey := fmt.Sprintf("tumbling_%d", windowStart.Unix())
+
+	window, exists := p.windows[windowKey]
+	if !exists {
+		window = &WindowState{
+			WindowStart:  windowStart,
+			WindowEnd:    windowEnd,
+			Groups:       make(map[string][]map[string]interface{}),
+			MessageCount: 0,
+		}
+		p.windows[windowKey] = window
+	}
+
+	// Add to group
+	if window.Groups[groupKey] == nil {
+		window.Groups[groupKey] = make([]map[string]interface{}, 0)
+	}
+	window.Groups[groupKey] = append(window.Groups[groupKey], payload)
+	window.MessageCount++
+}
+
+func (p *Processor) addToSlidingWindows(payload map[string]interface{}, groupKey string, timestamp time.Time) {
+	// For sliding windows, create multiple overlapping windows
+	windowStart := timestamp.Truncate(p.config.SlideBy)
+
+	// Create windows that this record should belong to
+	for i := 0; i < int(p.config.WindowSize/p.config.SlideBy); i++ {
+		currentWindowStart := windowStart.Add(time.Duration(-i) * p.config.SlideBy)
+		windowEnd := currentWindowStart.Add(p.config.WindowSize)
+
+		// Only create window if timestamp falls within it
+		if timestamp.After(currentWindowStart) && !timestamp.After(windowEnd) {
+			windowKey := fmt.Sprintf("sliding_%d", currentWindowStart.Unix())
+
+			window, exists := p.windows[windowKey]
+			if !exists {
+				window = &WindowState{
+					WindowStart:  currentWindowStart,
+					WindowEnd:    windowEnd,
+					Groups:       make(map[string][]map[string]interface{}),
+					MessageCount: 0,
+				}
+				p.windows[windowKey] = window
+			}
+
+			// Add to group
+			if window.Groups[groupKey] == nil {
+				window.Groups[groupKey] = make([]map[string]interface{}, 0)
+			}
+			window.Groups[groupKey] = append(window.Groups[groupKey], payload)
+			window.MessageCount++
+		}
+	}
+}
+
+func (p *Processor) aggregateWindow(window *WindowState) []opencdc.Record {
+	if p.config.OutputFormat == "per_group" {
+		return p.generatePerGroupOutput(window)
+	} else {
+		return p.generateSingleOutput(window)
+	}
+}
+
+func (p *Processor) generatePerGroupOutput(window *WindowState) []opencdc.Record {
+	var records []opencdc.Record
+
+	for groupKey, groupData := range window.Groups {
+		aggregations := p.calculateAggregations(groupData)
+
+		payload := map[string]interface{}{
+			"window_start": window.WindowStart.Format(time.RFC3339),
+			"window_end":   window.WindowEnd.Format(time.RFC3339),
+			"window_type":  p.config.WindowType,
+			"group_key":    groupKey,
+			"group_value":  aggregations,
+			"count":        float64(len(groupData)), // Use float64 for JSON consistency
+		}
+
+		payloadBytes, _ := json.Marshal(payload)
+
+		record := opencdc.Record{
+			Operation: opencdc.OperationCreate,
+			Payload: opencdc.Change{
+				After: opencdc.RawData(payloadBytes),
+			},
+			Metadata: opencdc.Metadata{
+				"conduit.aggregate.group.key":    groupKey,
+				"conduit.aggregate.window.start": window.WindowStart.Format(time.RFC3339),
+				"conduit.aggregate.window.end":   window.WindowEnd.Format(time.RFC3339),
+				"conduit.aggregate.window.type":  p.config.WindowType,
+			},
+		}
+
+		records = append(records, record)
 	}
 
 	return records
 }
 
-// createSingleAggregateRecord creates a single record with all groups aggregated
-func (p *Processor) createSingleAggregateRecord(window *WindowState) opencdc.Record {
-	result := map[string]interface{}{
+func (p *Processor) generateSingleOutput(window *WindowState) []opencdc.Record {
+	allGroups := make(map[string]interface{})
+	totalCount := 0
+
+	for groupKey, groupData := range window.Groups {
+		allGroups[groupKey] = p.calculateAggregations(groupData)
+		totalCount += len(groupData)
+	}
+
+	payload := map[string]interface{}{
 		"window_start": window.WindowStart.Format(time.RFC3339),
 		"window_end":   window.WindowEnd.Format(time.RFC3339),
 		"window_type":  p.config.WindowType,
-		"groups":       make(map[string]interface{}),
-		"total_count":  window.MessageCount,
+		"groups":       allGroups,
+		"total_count":  float64(totalCount), // Use float64 for JSON consistency
 	}
 
-	// Aggregate each group
-	groups := result["groups"].(map[string]interface{})
-	for groupKey, messages := range window.Groups {
-		groups[groupKey] = p.calculateAggregations(messages)
-	}
+	payloadBytes, _ := json.Marshal(payload)
 
-	payload, _ := json.Marshal(result)
-	return opencdc.Record{
+	record := opencdc.Record{
+		Operation: opencdc.OperationCreate,
 		Payload: opencdc.Change{
-			After: opencdc.RawData(payload),
+			After: opencdc.RawData(payloadBytes),
 		},
 		Metadata: opencdc.Metadata{
 			"conduit.aggregate.window.start": window.WindowStart.Format(time.RFC3339),
 			"conduit.aggregate.window.end":   window.WindowEnd.Format(time.RFC3339),
 			"conduit.aggregate.window.type":  p.config.WindowType,
-			"conduit.aggregate.group.count":  fmt.Sprintf("%d", len(window.Groups)),
 		},
 	}
+
+	return []opencdc.Record{record}
 }
 
-// createGroupAggregateRecord creates a record for a specific group
-func (p *Processor) createGroupAggregateRecord(window *WindowState, groupKey string, messages []map[string]interface{}) opencdc.Record {
-	aggregations := p.calculateAggregations(messages)
+func (p *Processor) calculateAggregations(groupData []map[string]interface{}) map[string]interface{} {
+	results := make(map[string]interface{})
 
-	result := map[string]interface{}{
-		"window_start": window.WindowStart.Format(time.RFC3339),
-		"window_end":   window.WindowEnd.Format(time.RFC3339),
-		"window_type":  p.config.WindowType,
-		"group_key":    groupKey,
-		"group_value":  aggregations,
-		"count":        len(messages),
-	}
-
-	payload, _ := json.Marshal(result)
-	return opencdc.Record{
-		Payload: opencdc.Change{
-			After: opencdc.RawData(payload),
-		},
-		Metadata: opencdc.Metadata{
-			"conduit.aggregate.window.start": window.WindowStart.Format(time.RFC3339),
-			"conduit.aggregate.window.end":   window.WindowEnd.Format(time.RFC3339),
-			"conduit.aggregate.window.type":  p.config.WindowType,
-			"conduit.aggregate.group.key":    groupKey,
-		},
-	}
-}
-
-// calculateAggregations performs the configured aggregations on a set of messages
-func (p *Processor) calculateAggregations(messages []map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-
-	for _, agg := range p.config.Aggregations {
+	for _, agg := range p.aggregations {
 		switch agg {
 		case "count":
-			result["count"] = len(messages)
-
+			// Return count as float64 to be consistent with JSON number handling
+			results["count"] = float64(len(groupData))
 		case "sum":
-			sums := make(map[string]float64)
-			for _, field := range p.config.Fields {
-				for _, msg := range messages {
-					if value := getNestedValue(msg, field); value != nil {
-						if num, err := parseFloat(value); err == nil {
-							sums[field] += num
-						}
-					}
-				}
-			}
-			result["sum"] = sums
-
+			results["sum"] = p.calculateSum(groupData)
 		case "avg":
-			avgs := make(map[string]float64)
-			for _, field := range p.config.Fields {
-				var sum float64
-				var count int
-				for _, msg := range messages {
-					if value := getNestedValue(msg, field); value != nil {
-						if num, err := parseFloat(value); err == nil {
-							sum += num
-							count++
-						}
-					}
-				}
-				if count > 0 {
-					avgs[field] = sum / float64(count)
-				}
-			}
-			result["avg"] = avgs
-
+			results["avg"] = p.calculateAvg(groupData)
 		case "min":
-			mins := make(map[string]float64)
-			for _, field := range p.config.Fields {
-				var min *float64
-				for _, msg := range messages {
-					if value := getNestedValue(msg, field); value != nil {
-						if num, err := parseFloat(value); err == nil {
-							if min == nil || num < *min {
-								min = &num
-							}
-						}
-					}
-				}
-				if min != nil {
-					mins[field] = *min
-				}
-			}
-			result["min"] = mins
-
+			results["min"] = p.calculateMin(groupData)
 		case "max":
-			maxs := make(map[string]float64)
-			for _, field := range p.config.Fields {
-				var max *float64
-				for _, msg := range messages {
-					if value := getNestedValue(msg, field); value != nil {
-						if num, err := parseFloat(value); err == nil {
-							if max == nil || num > *max {
-								max = &num
-							}
-						}
-					}
-				}
-				if max != nil {
-					maxs[field] = *max
-				}
-			}
-			result["max"] = maxs
-
+			results["max"] = p.calculateMax(groupData)
 		case "unique_count":
-			uniques := make(map[string]map[interface{}]bool)
-			for _, field := range p.config.Fields {
-				uniques[field] = make(map[interface{}]bool)
-				for _, msg := range messages {
-					if value := getNestedValue(msg, field); value != nil {
-						uniques[field][value] = true
-					}
-				}
-			}
-			counts := make(map[string]int)
-			for field, unique := range uniques {
-				counts[field] = len(unique)
-			}
-			result["unique_count"] = counts
-
+			results["unique_count"] = p.calculateUniqueCount(groupData)
 		case "collect":
-			collections := make(map[string][]interface{})
-			for _, field := range p.config.Fields {
-				for _, msg := range messages {
-					if value := getNestedValue(msg, field); value != nil {
-						collections[field] = append(collections[field], value)
+			results["collect"] = p.calculateCollect(groupData)
+		}
+	}
+
+	return results
+}
+
+func (p *Processor) calculateSum(groupData []map[string]interface{}) map[string]float64 {
+	sums := make(map[string]float64)
+
+	for _, field := range p.fields {
+		sum := 0.0
+		for _, record := range groupData {
+			if value, exists := record[field]; exists {
+				if floatVal, ok := value.(float64); ok {
+					sum += floatVal
+				} else if intVal, ok := value.(int); ok {
+					sum += float64(intVal)
+				} else if strVal, ok := value.(string); ok {
+					if parsed, err := strconv.ParseFloat(strVal, 64); err == nil {
+						sum += parsed
 					}
 				}
 			}
-			result["collect"] = collections
+		}
+		sums[field] = sum
+	}
+
+	return sums
+}
+
+func (p *Processor) calculateAvg(groupData []map[string]interface{}) map[string]float64 {
+	avgs := make(map[string]float64)
+	sums := p.calculateSum(groupData)
+
+	for field, sum := range sums {
+		if len(groupData) > 0 {
+			avgs[field] = sum / float64(len(groupData))
+		}
+	}
+
+	return avgs
+}
+
+func (p *Processor) calculateMin(groupData []map[string]interface{}) map[string]float64 {
+	mins := make(map[string]float64)
+
+	for _, field := range p.fields {
+		var min *float64
+		for _, record := range groupData {
+			if value, exists := record[field]; exists {
+				var floatVal float64
+				var ok bool
+
+				if floatVal, ok = value.(float64); ok {
+					// Already float64
+				} else if intVal, ok := value.(int); ok {
+					floatVal = float64(intVal)
+					ok = true
+				} else if strVal, ok := value.(string); ok {
+					if parsed, err := strconv.ParseFloat(strVal, 64); err == nil {
+						floatVal = parsed
+						ok = true
+					} else {
+						ok = false
+					}
+				}
+
+				if ok {
+					if min == nil || floatVal < *min {
+						min = &floatVal
+					}
+				}
+			}
+		}
+		if min != nil {
+			mins[field] = *min
+		}
+	}
+
+	return mins
+}
+
+func (p *Processor) calculateMax(groupData []map[string]interface{}) map[string]float64 {
+	maxs := make(map[string]float64)
+
+	for _, field := range p.fields {
+		var max *float64
+		for _, record := range groupData {
+			if value, exists := record[field]; exists {
+				var floatVal float64
+				var ok bool
+
+				if floatVal, ok = value.(float64); ok {
+					// Already float64
+				} else if intVal, ok := value.(int); ok {
+					floatVal = float64(intVal)
+					ok = true
+				} else if strVal, ok := value.(string); ok {
+					if parsed, err := strconv.ParseFloat(strVal, 64); err == nil {
+						floatVal = parsed
+						ok = true
+					} else {
+						ok = false
+					}
+				}
+
+				if ok {
+					if max == nil || floatVal > *max {
+						max = &floatVal
+					}
+				}
+			}
+		}
+		if max != nil {
+			maxs[field] = *max
+		}
+	}
+
+	return maxs
+}
+
+func (p *Processor) calculateUniqueCount(groupData []map[string]interface{}) map[string]float64 {
+	uniqueCounts := make(map[string]float64)
+
+	for _, field := range p.fields {
+		unique := make(map[interface{}]bool)
+		for _, record := range groupData {
+			if value, exists := record[field]; exists {
+				unique[value] = true
+			}
+		}
+		uniqueCounts[field] = float64(len(unique))
+	}
+
+	return uniqueCounts
+}
+
+func (p *Processor) calculateCollect(groupData []map[string]interface{}) map[string][]interface{} {
+	collections := make(map[string][]interface{})
+
+	for _, field := range p.fields {
+		var values []interface{}
+		for _, record := range groupData {
+			if value, exists := record[field]; exists {
+				values = append(values, value)
+			}
+		}
+		collections[field] = values
+	}
+
+	return collections
+}
+
+func parseCommaSeparated(input string) []string {
+	if input == "" {
+		return []string{}
+	}
+
+	parts := strings.Split(input, ",")
+	result := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
 		}
 	}
 
 	return result
-}
-
-// parseFloat attempts to parse various numeric types to float64
-func parseFloat(value interface{}) (float64, error) {
-	switch v := value.(type) {
-	case float64:
-		return v, nil
-	case float32:
-		return float64(v), nil
-	case int:
-		return float64(v), nil
-	case int32:
-		return float64(v), nil
-	case int64:
-		return float64(v), nil
-	case string:
-		return strconv.ParseFloat(v, 64)
-	default:
-		return 0, fmt.Errorf("unsupported type: %T", value)
-	}
-}
-
-// cleanupRoutine periodically cleans up old windows
-func (p *Processor) cleanupRoutine(ctx context.Context) {
-	ticker := time.NewTicker(p.windowDur / 4) // Clean up 4 times per window
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			now := time.Now()
-			for windowKey, window := range p.windows {
-				// Remove windows that are well past their end time
-				if now.After(window.WindowEnd.Add(p.lateness).Add(p.windowDur)) {
-					delete(p.windows, windowKey)
-				}
-			}
-		}
-	}
-}
-
-// NewProcessor creates a new aggregate processor instance
-func NewProcessor() sdk.Processor {
-	return &Processor{}
 }

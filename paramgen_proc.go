@@ -8,29 +8,72 @@ import (
 )
 
 const (
-	ProcessorConfigField     = "field"
-	ProcessorConfigThreshold = "threshold"
+	ProcessorConfigAggregations    = "aggregations"
+	ProcessorConfigAllowedLateness = "allowed_lateness"
+	ProcessorConfigFields          = "fields"
+	ProcessorConfigGroupBy         = "group_by"
+	ProcessorConfigOutputFormat    = "output_format"
+	ProcessorConfigSlideBy         = "slide_by"
+	ProcessorConfigTimestampField  = "timestamp_field"
+	ProcessorConfigWindowSize      = "window_size"
+	ProcessorConfigWindowType      = "window_type"
 )
 
 func (ProcessorConfig) Parameters() map[string]config.Parameter {
 	return map[string]config.Parameter{
-		ProcessorConfigField: {
+		ProcessorConfigAggregations: {
 			Default:     "",
-			Description: "Field is the target field that will be set.",
+			Description: "Aggregations defines what aggregations to perform on the grouped data\nSupported: sum, count, avg, min, max, unique_count, collect\nCan be comma-separated string like \"count,sum,avg\"",
 			Type:        config.ParameterTypeString,
-			Validations: []config.Validation{
-				config.ValidationRequired{},
-				config.ValidationExclusion{List: []string{".Position"}},
-			},
+			Validations: []config.Validation{},
 		},
-		ProcessorConfigThreshold: {
+		ProcessorConfigAllowedLateness: {
 			Default:     "",
-			Description: "Threshold is the threshold for filtering the record.",
-			Type:        config.ParameterTypeInt,
-			Validations: []config.Validation{
-				config.ValidationRequired{},
-				config.ValidationGreaterThan{V: 0},
-			},
+			Description: "AllowedLateness allows late messages within this duration",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
+		},
+		ProcessorConfigFields: {
+			Default:     "",
+			Description: "Fields defines which fields to aggregate (used with sum, avg, min, max)\nCan be comma-separated string like \"amount,quantity\"",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
+		},
+		ProcessorConfigGroupBy: {
+			Default:     "",
+			Description: "GroupBy is the field path to group messages by (e.g., \"user_id\" or \"user.profile.id\")",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
+		},
+		ProcessorConfigOutputFormat: {
+			Default:     "",
+			Description: "OutputFormat defines how to output results: \"single\" or \"per_group\"",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
+		},
+		ProcessorConfigSlideBy: {
+			Default:     "",
+			Description: "SlideBy defines the slide interval for sliding windows (e.g., \"30s\")\nOnly used when WindowType is \"sliding\"",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
+		},
+		ProcessorConfigTimestampField: {
+			Default:     "",
+			Description: "TimestampField is the field to use for event time (empty = processing time)",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
+		},
+		ProcessorConfigWindowSize: {
+			Default:     "",
+			Description: "WindowSize defines the time window duration (e.g., \"1m\", \"5s\", \"1h\")",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
+		},
+		ProcessorConfigWindowType: {
+			Default:     "",
+			Description: "WindowType defines the window type: \"tumbling\" or \"sliding\"",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
 		},
 	}
 }
