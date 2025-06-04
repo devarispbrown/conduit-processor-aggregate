@@ -8,6 +8,6 @@ Fixes # (issue)
 
 ### Quick checks:
 
-- [ ] There is no other [pull request](https://github.com/conduitio/conduit-processor-processorname/pulls) for the same update/change.
+- [ ] There is no other [pull request](https://github.com/devarispbrown/conduit-processor-aggregate/pulls) for the same update/change.
 - [ ] I have written unit tests.
 - [ ] I have made sure that the PR is of reasonable size and can be easily reviewed.

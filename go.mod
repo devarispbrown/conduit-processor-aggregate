@@ -1,4 +1,4 @@
-module github.com/conduitio/conduit-processor-processorname
+module github.com/devarispbrown/conduit-processor-aggregate
 
 go 1.24.2
 

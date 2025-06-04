@@ -4,9 +4,9 @@ package main
 
 import (
 	sdk "github.com/conduitio/conduit-processor-sdk"
-	processorname "github.com/conduitio/conduit-processor-processorname"
+	aggregate "github.com/devarispbrown/conduit-processor-aggregate"
 )
 
 func main() {
-	sdk.Run(processorname.NewProcessor())
+	sdk.Run(aggregate.NewProcessor())
 }

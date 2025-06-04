@@ -1,1 +1,1 @@
-package processorname
+package aggregate

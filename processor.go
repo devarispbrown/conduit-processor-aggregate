@@ -1,4 +1,4 @@
-package processorname
+package aggregate
 
 import (
 	"context"
@@ -56,7 +56,7 @@ func (p *Processor) Specification() (sdk.Specification, error) {
 	// parameters it expects.
 
 	return sdk.Specification{
-		Name:        "processorname",
+		Name:        "aggregate",
 		Summary:     "<describe your processor>",
 		Description: "<describe your processor in detail>",
 		Version:     "devel",
